@@ -9,8 +9,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from xsync.__main__ import Application
+from xsync.__main__ import Application, Favorites
 from xsync.connections import scan_key
+from xsync.filesystem import wsl_path, wsl_root
 
 
 PAYLOAD = bytes(range(256)) * 1500
@@ -22,7 +23,7 @@ class LocalTransfers(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
         self.app = Application(self.directory / "config")
-        self.addCleanup(self.app.jobs.close)
+        self.addCleanup(self.app.close)
         self.original = self.directory / "example file.txt"
         self.original.write_bytes(PAYLOAD)
         self.target = self.directory / "destination"
@@ -65,6 +66,49 @@ class LocalTransferTests(LocalTransfers):
     def test_copy_into_self_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "outside the source"):
             self.submit(path=self.directory, target=self.target)
+
+    def test_favorites_persist_per_endpoint(self):
+        local, remote = str(self.directory), "/srv/data"
+        self.app.favorites.change("", local)
+        self.app.favorites.change("ssh-profile", remote)
+        self.app.favorites.change("ssh-profile", remote)
+        self.app.favorites.change("wsl:Ubuntu", wsl_root("wsl:Ubuntu"))
+        restored = Favorites(self.directory / "config")
+        self.assertEqual(restored.list(""), [local])
+        self.assertEqual(restored.list("ssh-profile"), [remote])
+        self.assertEqual(restored.list("wsl:Ubuntu"), [wsl_root("wsl:Ubuntu")])
+        restored.change("ssh-profile", remote, remove=True)
+        self.assertEqual(restored.list("ssh-profile"), [])
+        self.assertEqual(restored.list(""), [local])
+
+    def test_wsl_share_is_scoped_to_selected_distribution(self):
+        root = wsl_root("wsl:Ubuntu")
+        self.assertEqual(wsl_path("wsl:Ubuntu"), root)
+        self.assertEqual(wsl_path("wsl:Ubuntu", root + r"home\dev"), root + r"home\dev")
+        self.assertEqual(wsl_path("wsl:Ubuntu", "/home/dev"), root + r"home\dev")
+        self.assertEqual(wsl_path("wsl:Ubuntu", r"\\wsl$\Ubuntu\home"), r"\\wsl$\Ubuntu\home")
+        with self.assertRaises(ValueError):
+            wsl_path("wsl:Ubuntu", wsl_root("wsl:Debian"))
+
+    def test_operations_and_retry(self):
+        self.app.file_operation("", "mkdir", [str(self.target)], "nested")
+        folder = self.target / "nested"
+        self.assertTrue(folder.is_dir())
+        self.app.file_operation("", "rename", [str(folder)], "renamed")
+        renamed = self.target / "renamed"
+        self.assertTrue(renamed.is_dir())
+        self.app.file_operation("", "delete", [str(renamed)])
+        self.assertFalse(renamed.exists())
+        missing = self.original.with_name("missing.txt")
+        job = self.finished(self.submit(path=missing), state="failed")
+        missing.write_bytes(b"retry")
+        retry, = self.app.jobs.retry([job["id"]])
+        finished = self.finished(retry)
+        self.assertEqual(finished["percent"], 100)
+        self.assertEqual(finished["total"], len(b"retry"))
+        self.assertEqual((self.target / missing.name).read_bytes(), b"retry")
+        self.app.jobs.remove_completed([job["id"]])
+        self.assertEqual([item["id"] for item in self.app.jobs.list()], [retry["id"]])
 
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("ssh-keygen") and shutil.which("sshd"),
@@ -139,6 +183,32 @@ class SSHTransferTests(LocalTransfers):
         self.assertEqual((result / "nested" / "empty.txt").stat().st_size, 0)
         listing = self.app.request("/api/list", {"host": second["id"], "path": str(result)})
         self.assertEqual([item["name"] for item in listing["entries"]], ["nested", "multiple blocks.bin"])
+
+    def test_browse_reuses_connection_and_refreshes_after_remote_operations(self):
+        peer = self.server("peer")
+        root = self.directory / "peer"
+        before = self.app.browse(peer["id"], str(root))
+        self.app.file_operation(peer["id"], "mkdir", [str(root)], "new")
+        self.app.file_operation(peer["id"], "rename", [str(root / "new")], "renamed")
+        self.assertIs(self.app.browse(peer["id"], str(root)), before)
+        session = next(iter(self.app.browser.entries.values())).sftp
+        after = self.app.browse(peer["id"], str(root), force=True)
+        self.assertIn("renamed", [item["name"] for item in after["entries"]])
+        self.assertIs(next(iter(self.app.browser.entries.values())).sftp, session)
+        self.assertEqual(len(session._expecting), 0)
+        (root / "renamed" / "file.txt").write_text("remove me", encoding="utf-8")
+        self.app.file_operation(peer["id"], "delete", [str(root / "renamed")])
+        self.assertFalse((root / "renamed").exists())
+
+    def test_prefetched_download_spans_multiple_windows(self):
+        peer = self.server("peer")
+        file = self.directory / "peer" / "large file.dat"
+        payload = PAYLOAD * 15 + b"tail"
+        file.write_bytes(payload)
+        job = self.finished(self.submit(source=peer, path=file, mode="sftp"), protocol="SFTP")
+        self.assertEqual(job["total"], len(payload))
+        self.assertEqual(job["bytes"], len(payload))
+        self.assertEqual((self.target / file.name).read_bytes(), payload)
 
     def test_scp_with_legacy_and_mixed_fallback(self):
         legacy = self.server("legacy", sftp=False)

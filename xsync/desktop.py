@@ -1,20 +1,22 @@
 import argparse
 import json
+import os
 import posixpath
 import secrets
 import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QMimeData, QObject, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QDrag, QKeySequence
+from PySide6.QtGui import QColor, QDrag, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSpinBox,
-    QSplitter, QStyle, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QSpinBox,
+    QSplitter, QStyle, QStyledItemDelegate, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .__main__ import Application, default_data_dir
+from .filesystem import WSL_PREFIX, is_wsl, remote_endpoint, wsl_distros
 from .transfers import ACTIVE, MAX_PENDING
 
 
@@ -29,21 +31,41 @@ PHASES = {
     "Failed": "失败", "Cancelled": "已取消",
 }
 STYLE = """
-QMainWindow, QDialog { background: #f0f5f2; color: #1b3229; }
+QMainWindow, QDialog { background: #eef2f8; color: #151f36; }
 QWidget { font-size: 13px; }
-QLabel#title { font-size: 21px; font-weight: bold; color: #173f31; }
-QLabel#heading { font-weight: bold; color: #254c3d; }
-QLabel#status { color: #50675d; }
-QLineEdit, QComboBox, QSpinBox { background: white; padding: 5px; border: 1px solid #cfddd6; border-radius: 5px; }
-QListWidget, QTreeWidget { background: white; alternate-background-color: #f7faf8;
-    border: 1px solid #d7e3db; border-radius: 5px; }
-QTreeWidget::item { padding: 3px 0; }
-QHeaderView::section { background: #eaf2ed; border: 0; border-bottom: 1px solid #d7e3db; padding: 6px; }
-QPushButton { background: white; border: 1px solid #cbdad1; border-radius: 5px; padding: 5px 10px; }
-QPushButton:hover { background: #e4f1e9; }
-QPushButton:disabled { color: #7a8b84; background: #f4f7f5; }
-QPushButton#primary { color: white; background: #24624c; border-color: #24624c; font-weight: bold; }
-QPushButton#primary:hover { background: #194c3a; }
+QLabel#title { font-size: 23px; font-weight: bold; color: #172842; }
+QLabel#mark { color: white; background: #2858cf; border-radius: 9px; font-size: 19px; font-weight: bold; }
+QLabel#heading { font-size: 14px; font-weight: bold; color: #233956; }
+QLabel#status, QStatusBar { color: #536781; }
+QWidget#sidebar { background: #172740; border-radius: 12px; }
+QWidget#sidebar QLabel { color: #e5edfb; font-weight: bold; }
+QWidget#sidebar QListWidget { background: #172740; color: #e5edfb; border: none; }
+QWidget#sidebar QListWidget::item { border-radius: 7px; padding: 9px 6px; }
+QWidget#sidebar QListWidget::item:selected, QWidget#sidebar QListWidget::item:hover { background: #2b4265; }
+QWidget#sidebar QPushButton { background: #243954; color: #eef4ff; border-color: #3a5071; }
+QWidget#sidebar QPushButton:hover { background: #355578; }
+QWidget#pane { background: #ffffff; border: 1px solid #d9e2ef; border-radius: 9px; }
+QLineEdit, QComboBox, QSpinBox { background: #ffffff; padding: 6px; border: 1px solid #cfdaea;
+    border-radius: 6px; selection-background-color: #2858cf; }
+QLineEdit:focus, QComboBox:focus { border: 1px solid #5074dd; }
+QListWidget, QTreeWidget { background: white; alternate-background-color: #f6f8fc;
+    border: 1px solid #d9e2ef; border-radius: 6px; selection-background-color: #dbe7ff; selection-color: #14294f; }
+QTreeWidget::item { padding: 5px 1px; }
+QTreeWidget::item:hover { background: #eaf1ff; }
+QHeaderView::section { background: #edf2fa; color: #405674; border: 0; border-bottom: 1px solid #d9e2ef; padding: 7px; }
+QPushButton { background: white; border: 1px solid #cfd9ea; border-radius: 7px; padding: 6px 10px; }
+QPushButton:hover { background: #e7efff; border-color: #a8bcef; }
+QPushButton:disabled { color: #8797ab; background: #f5f7fa; }
+QPushButton#primary { color: #ffffff; background: #2858cf; border-color: #2858cf; font-weight: bold; }
+QPushButton#primary:hover { background: #234cb0; }
+QTabWidget::pane { border: 0; padding-top: 5px; }
+QTabBar::tab { background: #e1e8f3; color: #4b607b; padding: 7px 11px; margin-right: 4px;
+    border-radius: 6px; min-width: 64px; }
+QTabBar::tab:selected { background: #ffffff; color: #254ea6; font-weight: bold; }
+QMenu { background: #ffffff; border: 1px solid #cfd9ea; color: #172842; padding: 4px; }
+QMenu::item { padding: 6px 22px; }
+QMenu::item:selected { background: #e5eeff; }
+QSplitter::handle { background: #e1e8f3; border-radius: 2px; }
 """
 
 
@@ -90,6 +112,7 @@ class Session(QObject):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(4)
         self.windows = set()
+        self.distros = wsl_distros()
 
     def new_window(self, initial=None):
         window = MainWindow(self, initial)
@@ -99,7 +122,7 @@ class Session(QObject):
 
     def mime(self, host, paths):
         data = QMimeData()
-        if host:
+        if remote_endpoint(host):
             payload = json.dumps({"session": self.drag_token, "host": host, "paths": paths})
             data.setData(FILE_MIME, QByteArray(payload.encode()))
         else:
@@ -158,6 +181,8 @@ class FileView(QTreeWidget):
         self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.itemActivated.connect(pane.open_item)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(pane.context_menu)
 
     def paths(self):
         return [item.data(0, ROLE)["path"] for item in self.selectedItems()
@@ -173,15 +198,22 @@ class FileView(QTreeWidget):
 
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.StandardKey.Copy):
-            paths = self.paths()
-            if paths:
-                QApplication.clipboard().setMimeData(self.pane.session.mime(self.pane.host, paths))
+            self.copy()
             event.accept()
         elif event.matches(QKeySequence.StandardKey.Paste):
             self.pane.receive(QApplication.clipboard().mimeData())
             event.accept()
+        elif event.key() == Qt.Key.Key_F2:
+            self.pane.rename_selection()
+        elif event.key() == Qt.Key.Key_Delete:
+            self.pane.delete_selection()
         else:
             super().keyPressEvent(event)
+
+    def copy(self):
+        paths = self.paths()
+        if paths:
+            QApplication.clipboard().setMimeData(self.pane.session.mime(self.pane.host, paths))
 
     def accept_file_event(self, event):
         mime = event.mimeData()
@@ -212,6 +244,7 @@ class FilePane(QWidget):
     def __init__(self, workspace, endpoint, path):
         super().__init__(workspace)
         self.workspace = workspace
+        self.setObjectName("pane")
         self.session = workspace.session
         self.host = endpoint
         self.path = path
@@ -219,6 +252,7 @@ class FilePane(QWidget):
         self.request = None
         self.pending = None
         self.updating = False
+        self.operation_running = False
 
         self.endpoint = QComboBox(self)
         self.endpoint.setObjectName("endpoint")
@@ -230,6 +264,8 @@ class FilePane(QWidget):
         self.up = control("↑", lambda: self.load(self.parent_path), self)
         self.up.setToolTip("返回上级目录")
         self.refresh = control("刷新", self.reload, self)
+        self.favorites = control("☆ 收藏", self.favorite_menu, self)
+        self.favorites.setToolTip("查看或添加当前端点的收藏路径")
         self.status = QLabel(self)
         self.status.setObjectName("status")
         self.status.setTextFormat(Qt.TextFormat.PlainText)
@@ -240,8 +276,12 @@ class FilePane(QWidget):
         nav.addWidget(self.up)
         nav.addWidget(self.address, 1)
         nav.addWidget(self.refresh)
+        bar = QHBoxLayout()
+        bar.addWidget(self.endpoint, 1)
+        bar.addWidget(self.favorites)
         layout = QVBoxLayout(self)
-        layout.addWidget(self.endpoint)
+        layout.setContentsMargins(11, 10, 11, 8)
+        layout.addLayout(bar)
         layout.addLayout(nav)
         layout.addWidget(self.view, 1)
         layout.addWidget(self.status)
@@ -259,6 +299,8 @@ class FilePane(QWidget):
         self.endpoint.addItem("此电脑", "")
         for host in hosts:
             self.endpoint.addItem(host["name"], host["id"])
+        for distro in self.session.distros:
+            self.endpoint.addItem("WSL · " + distro, WSL_PREFIX + distro)
         index = self.endpoint.findData(current)
         self.endpoint.setCurrentIndex(max(0, index))
         self.endpoint.blockSignals(False)
@@ -278,20 +320,22 @@ class FilePane(QWidget):
         self.endpoint.blockSignals(False)
         self.load("")
 
-    def load(self, path):
+    def load(self, path, force=False):
         self.path = path
         self.address.setText(path)
+        self.address.setPlaceholderText("输入 WSL 路径，如 /home" if is_wsl(self.host) else "输入绝对路径后按 Enter")
         self.parent_path = ""
         self.view.clear()
         self.up.setEnabled(False)
         self.address.setEnabled(self.host is not None)
         self.refresh.setEnabled(self.host is not None)
+        self.favorites.setEnabled(self.host is not None)
         if self.host is None:
             self.pending = None
             self.status.setText("从列表选择一个连接，或打开本机目录。")
             return
         self.status.setText("正在打开目录…")
-        self.pending = (self.host, path)
+        self.pending = (self.host, path, force)
         self.start_pending()
 
     def start_pending(self):
@@ -300,14 +344,14 @@ class FilePane(QWidget):
         self.request = self.pending
         self.pending = None
         self.updating = True
-        host, path = self.request
+        host, path, force = self.request
         app = self.session.app
-        self.session.pool.start(Work(lambda: app.request("/api/list", {"host": host, "path": path}), self.listed))
+        self.session.pool.start(Work(lambda: app.browse(host, path, force), self.listed))
 
     @Slot(object, str)
     def listed(self, listing, error):
         self.updating = False
-        if self.request != (self.host, self.path) or self.pending is not None:
+        if self.request[:2] != (self.host, self.path) or self.pending is not None:
             self.start_pending()
             return
         if error:
@@ -335,7 +379,97 @@ class FilePane(QWidget):
 
     @Slot()
     def reload(self):
-        self.load(self.address.text())
+        self.load(self.address.text(), force=True)
+
+    @Slot()
+    def favorite_menu(self):
+        menu = QMenu(self)
+        paths = self.session.app.favorites.list(self.host)
+        for path in paths:
+            menu.addAction(path.replace("&", "&&"), lambda _checked=False, path=path: self.load(path))
+        if paths:
+            menu.addSeparator()
+        menu.addAction("收藏当前路径", lambda: self.change_favorite(self.path)).setEnabled(bool(self.path))
+        if paths:
+            remove = menu.addMenu("移除收藏")
+            for path in paths:
+                remove.addAction(path.replace("&", "&&"),
+                                 lambda _checked=False, path=path: self.change_favorite(path, True))
+        menu.exec(self.favorites.mapToGlobal(self.favorites.rect().bottomLeft()))
+        menu.deleteLater()
+
+    def change_favorite(self, path, remove=False):
+        try:
+            self.session.app.favorites.change(self.host, path, remove)
+        except (OSError, ValueError) as error:
+            self.window().statusBar().showMessage(str(error), 6500)
+        else:
+            self.window().statusBar().showMessage("已移除收藏" if remove else "已收藏路径", 3500)
+
+    def selection(self):
+        return [item.data(0, ROLE) for item in self.view.selectedItems()]
+
+    def context_menu(self, position):
+        if self.host is None or not self.path or self.updating or self.operation_running:
+            return
+        item = self.view.itemAt(position)
+        if item and not item.isSelected():
+            self.view.clearSelection()
+            item.setSelected(True)
+        entries = self.selection()
+        menu = QMenu(self)
+        if item and item.data(0, ROLE)["kind"] == "directory":
+            entry = item.data(0, ROLE)
+            menu.addAction("打开文件夹", lambda: self.load(entry["path"]))
+            menu.addAction("收藏此文件夹", lambda: self.change_favorite(entry["path"]))
+            menu.addSeparator()
+        menu.addAction("复制    Ctrl+C", self.view.copy).setEnabled(bool(self.view.paths()))
+        menu.addAction("粘贴    Ctrl+V", lambda: self.receive(QApplication.clipboard().mimeData()))
+        menu.addSeparator()
+        menu.addAction("新建文件夹…", self.make_directory)
+        menu.addAction("重命名…    F2", self.rename_selection).setEnabled(len(entries) == 1)
+        menu.addAction("删除…    Del", self.delete_selection).setEnabled(bool(entries))
+        menu.exec(self.view.viewport().mapToGlobal(position))
+        menu.deleteLater()
+
+    def make_directory(self):
+        name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称")
+        if ok and name:
+            self.perform("mkdir", [self.path], name)
+
+    def rename_selection(self):
+        entries = self.selection()
+        if len(entries) != 1 or self.updating or self.operation_running:
+            return
+        entry = entries[0]
+        name, ok = QInputDialog.getText(self, "重命名", "新名称", text=entry["name"])
+        if ok and name:
+            self.perform("rename", [entry["path"]], name)
+
+    def delete_selection(self):
+        entries = self.selection()
+        if not entries or self.updating or self.operation_running:
+            return
+        prompt = f"永久删除选中的 {len(entries)} 项？文件夹中的内容也会删除。"
+        if QMessageBox.question(self, "永久删除", prompt,
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self.perform("delete", [entry["path"] for entry in entries])
+
+    def perform(self, operation, paths, name=""):
+        host, app = self.host, self.session.app
+        self.operation_running = True
+        self.status.setText("正在处理文件…")
+        self.session.pool.start(Work(lambda: app.file_operation(host, operation, paths, name), self.operated))
+
+    @Slot(object, str)
+    def operated(self, _result, error):
+        self.operation_running = False
+        if error:
+            self.window().statusBar().showMessage(error, 8500)
+        else:
+            self.window().statusBar().showMessage("文件操作完成", 3000)
+        self.load(self.path, force=True)
 
     def open_item(self, item, _column):
         entry = item.data(0, ROLE)
@@ -405,7 +539,8 @@ class TransferDialog(QDialog):
 
     @Slot()
     def update_direct(self):
-        allowed = bool(self.origin.host and self.target.host and self.protocol.currentData() in {"auto", "rsync"})
+        allowed = bool(remote_endpoint(self.origin.host) and remote_endpoint(self.target.host)
+                       and self.protocol.currentData() in {"auto", "rsync"})
         self.direct.setVisible(allowed)
         self.direct_key.setVisible(allowed and self.direct.isChecked())
 
@@ -568,18 +703,49 @@ class Workspace(QWidget):
         return ((self.left.host, self.left.path), (self.right.host, self.right.path))
 
 
+class ProgressDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        percent = index.data(ROLE)
+        if percent is None:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        track = option.rect.adjusted(9, 5, -9, -5)
+        painter.fillRect(track, QColor("#e8eef8"))
+        fill = track.adjusted(0, 0, -(track.width() - track.width() * percent // 100), 0)
+        if fill.width() > 0:
+            painter.fillRect(fill, QColor("#abc5ff"))
+        painter.setPen(QColor("#17396f"))
+        painter.drawText(track, Qt.AlignmentFlag.AlignCenter, f"{percent}%")
+        painter.restore()
+
+
+def time_remaining(seconds):
+    if seconds is None:
+        return "—"
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self, session, initial):
         super().__init__()
         self.session = session
         self.setWindowTitle("xSync · 文件传输")
-        self.resize(1160, 740)
-        self.setMinimumSize(800, 525)
+        self.resize(1240, 790)
+        self.setMinimumSize(900, 560)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabBarDoubleClicked.connect(self.rename_tab)
+        add = control("＋ 新标签", self.add_tab, self.tabs)
+        self.tabs.setCornerWidget(add)
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.add_tab)
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=lambda: self.close_tab(self.tabs.currentIndex()))
         self.tab_number = 0
         self.add_tab(initial)
 
@@ -589,23 +755,30 @@ class MainWindow(QMainWindow):
         self.session.changed.connect(self.refresh_hosts)
         self.refresh_hosts()
         self.jobs = QTreeWidget(self)
-        self.jobs.setHeaderLabels(["文件", "路径", "协议", "状态"])
+        self.jobs.setHeaderLabels(["文件", "端点", "协议", "进度", "速率", "剩余时间", "状态"])
         self.jobs.setRootIsDecorated(False)
         self.jobs.setAlternatingRowColors(True)
-        for column in (1, 2):
+        self.jobs.setUniformRowHeights(True)
+        self.jobs.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.jobs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.jobs.customContextMenuRequested.connect(self.job_menu)
+        self.jobs.setItemDelegateForColumn(3, ProgressDelegate(self.jobs))
+        for column in (1, 2, 4, 5):
             self.jobs.header().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.jobs.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.jobs.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.jobs.setMinimumHeight(110)
-        self.jobs.setMaximumHeight(194)
+        self.jobs.header().resizeSection(3, 112)
+        self.jobs.header().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.jobs.setMinimumHeight(105)
+        self.job_rows = {}
         self.last_jobs = None
 
         sidebar = QWidget(self)
+        sidebar.setObjectName("sidebar")
         sidebar.setMaximumWidth(245)
-        sidebar.setMinimumWidth(135)
+        sidebar.setMinimumWidth(160)
         side = QVBoxLayout(sidebar)
+        side.setContentsMargins(12, 15, 12, 12)
         connection_heading = QLabel("已保存的连接", self)
-        connection_heading.setObjectName("heading")
         side.addWidget(connection_heading)
         side.addWidget(self.hosts, 1)
         side.addWidget(control("添加连接", self.add_host, self))
@@ -614,27 +787,44 @@ class MainWindow(QMainWindow):
 
         central = QWidget(self)
         column = QVBoxLayout(central)
-        column.setContentsMargins(16, 12, 16, 5)
+        column.setContentsMargins(17, 13, 17, 5)
+        column.setSpacing(12)
         title = QLabel("xSync", self)
         title.setObjectName("title")
+        mark = QLabel("X", self)
+        mark.setObjectName("mark")
+        mark.setFixedSize(33, 33)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         toolbar = QHBoxLayout()
+        toolbar.addWidget(mark)
         toolbar.addWidget(title)
         toolbar.addStretch()
-        toolbar.addWidget(control("新建标签页", self.add_tab, self))
+        if os.name == "nt":
+            wsl = control("刷新 WSL", self.refresh_wsl, self)
+            wsl.setToolTip("重新检测已安装的 WSL 发行版")
+            toolbar.addWidget(wsl)
         toolbar.addWidget(control("新窗口", self.open_window, self))
         column.addLayout(toolbar)
         body = QHBoxLayout()
         body.addWidget(sidebar, 1)
-        body.addWidget(self.tabs, 5)
-        column.addLayout(body, 1)
+        stack = QSplitter(Qt.Orientation.Vertical, self)
+        stack.addWidget(self.tabs)
+        queue = QWidget(self)
+        queue_layout = QVBoxLayout(queue)
+        queue_layout.setContentsMargins(0, 4, 0, 0)
         queue_bar = QHBoxLayout()
-        queue_title = QLabel("传输队列", self)
-        queue_title.setObjectName("heading")
-        queue_bar.addWidget(queue_title)
+        self.queue_title = QLabel("传输队列", self)
+        self.queue_title.setObjectName("heading")
+        queue_bar.addWidget(self.queue_title)
         queue_bar.addStretch()
         queue_bar.addWidget(control("取消选中任务", self.cancel, self))
-        column.addLayout(queue_bar)
-        column.addWidget(self.jobs)
+        queue_layout.addLayout(queue_bar)
+        queue_layout.addWidget(self.jobs)
+        stack.addWidget(queue)
+        stack.setChildrenCollapsible(False)
+        stack.setSizes([430, 185])
+        body.addWidget(stack, 5)
+        column.addLayout(body, 1)
         self.setCentralWidget(central)
         self.statusBar().showMessage("可将文件拖到目标面板，或在目标面板按 Ctrl+V。")
         self.timer = QTimer(self)
@@ -658,6 +848,21 @@ class MainWindow(QMainWindow):
         tab.deleteLater()
         if not self.tabs.count():
             self.add_tab()
+
+    @Slot(int)
+    def rename_tab(self, index):
+        if index < 0:
+            return
+        name, ok = QInputDialog.getText(self, "重命名标签", "标签名称", text=self.tabs.tabText(index))
+        if ok and name.strip():
+            self.tabs.setTabText(index, name.strip()[:48])
+
+    @Slot()
+    def refresh_wsl(self):
+        self.session.distros = wsl_distros()
+        self.session.changed.emit()
+        message = f"找到 {len(self.session.distros)} 个 WSL 发行版" if self.session.distros else "未找到 WSL 发行版"
+        self.statusBar().showMessage(message, 5000)
 
     @Slot()
     def open_window(self):
@@ -706,7 +911,7 @@ class MainWindow(QMainWindow):
         item = self.hosts.currentItem()
         if item and QMessageBox.question(self, "移除连接", f"移除「{item.text()}」？") == QMessageBox.StandardButton.Yes:
             try:
-                self.session.app.profiles.remove(item.data(ROLE))
+                self.session.app.remove_host(item.data(ROLE))
             except OSError as error:
                 self.statusBar().showMessage(str(error), 6000)
             else:
@@ -725,24 +930,68 @@ class MainWindow(QMainWindow):
         ):
             for pane in (tab.left, tab.right):
                 if pane.path and not pane.address.hasFocus():
-                    pane.load(pane.path)
+                    pane.load(pane.path, force=True)
         self.last_jobs = snapshot
-        selected = {item.data(0, ROLE) for item in self.jobs.selectedItems()}
-        scroll = self.jobs.verticalScrollBar().value()
-        self.jobs.clear()
-        for job in snapshot:
+        current = {job["id"] for job in snapshot}
+        for key in self.job_rows.keys() - current:
+            item = self.job_rows.pop(key)
+            self.jobs.takeTopLevelItem(self.jobs.indexOfTopLevelItem(item))
+        pending = sum(job["state"] in ACTIVE for job in snapshot)
+        self.queue_title.setText(f"传输队列  ·  {pending} 进行中" if pending else "传输队列")
+        for job in reversed(snapshot):
             state = PHASES.get(job["phase"], job["phase"])
-            if job["bytes"]:
-                state += f' · {size_text(job["bytes"])}'
             if job["error"]:
                 state += " · " + job["error"]
-            row = QTreeWidgetItem(self.jobs, [
-                job["file"], f'{job["source"]} → {job["destination"]}', job["protocol"], state,
-            ])
-            row.setData(0, ROLE, job["id"])
-            row.setToolTip(3, state)
-            row.setSelected(job["id"] in selected)
-        self.jobs.verticalScrollBar().setValue(scroll)
+            total, count, rate = job["total"], job["bytes"], job["rate"]
+            percent = job["percent"]
+            if percent is None and total:
+                percent = min(100, count * 100 // total)
+            eta = job["eta"]
+            if eta is None and total and rate:
+                eta = (total - count) / rate
+            row = self.job_rows.get(job["id"])
+            if row is None:
+                row = QTreeWidgetItem()
+                row.setData(0, ROLE, job["id"])
+                self.job_rows[job["id"]] = row
+                self.jobs.insertTopLevelItem(0, row)
+            texts = (job["file"], f'{job["source"]} → {job["destination"]}', job["protocol"],
+                     size_text(count) if count else "—", size_text(rate) + "/s" if rate else "—",
+                     time_remaining(eta) if job["state"] in ACTIVE else "—", state)
+            for index, text in enumerate(texts):
+                if row.text(index) != text:
+                    row.setText(index, text)
+            row.setData(3, ROLE, percent)
+            row.setToolTip(3, f"{size_text(count)} / {size_text(total)}" if total is not None else size_text(count))
+            row.setToolTip(6, state)
+
+    def job_menu(self, position):
+        item = self.jobs.itemAt(position)
+        if item and not item.isSelected():
+            self.jobs.clearSelection()
+            item.setSelected(True)
+        ids = [entry.data(0, ROLE) for entry in self.jobs.selectedItems()]
+        states = {job["state"] for job in self.session.app.jobs.list() if job["id"] in ids}
+        menu = QMenu(self)
+        menu.addAction("取消选中任务", self.cancel).setEnabled(bool(states & ACTIVE))
+        menu.addAction("重试失败或取消的任务", lambda: self.retry_jobs(ids)).setEnabled(
+            bool(states & {"failed", "cancelled"}))
+        menu.addAction("移除选中记录", lambda: self.remove_jobs(ids)).setEnabled(bool(states - ACTIVE))
+        menu.addSeparator()
+        menu.addAction("清理已结束的记录", self.remove_jobs)
+        menu.exec(self.jobs.viewport().mapToGlobal(position))
+        menu.deleteLater()
+
+    def remove_jobs(self, ids=None):
+        self.session.app.jobs.remove_completed(ids)
+        self.refresh_jobs()
+
+    def retry_jobs(self, ids):
+        try:
+            self.session.app.jobs.retry(ids)
+        except (ValueError, RuntimeError) as error:
+            self.statusBar().showMessage(str(error), 6000)
+        self.refresh_jobs()
 
     @Slot()
     def cancel(self):
@@ -780,8 +1029,8 @@ def main():
         return qt.exec()
     finally:
         session.pool.clear()
-        session.app.jobs.close()
         session.pool.waitForDone()
+        session.app.close()
 
 
 if __name__ == "__main__":

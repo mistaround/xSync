@@ -47,7 +47,7 @@ class DesktopTests(unittest.TestCase):
     def stop_session(self):
         QApplication.clipboard().clear()
         self.session.pool.waitForDone()
-        self.session.app.jobs.close()
+        self.session.app.close()
         for window in list(self.session.windows):
             window.close()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
@@ -115,6 +115,31 @@ class DesktopTests(unittest.TestCase):
         with patch.object(self.session, "drag_token", "foreign-session"):
             with self.assertRaisesRegex(ValueError, "仅在当前"):
                 self.session.files_from(mime)
+
+    def test_new_tab_favorites_and_file_actions(self):
+        self.window.add_tab(self.tab.snapshot())
+        new = self.window.tabs.currentWidget()
+        self.assertEqual(self.window.tabs.count(), 2)
+        self.wait_for(lambda: not new.right.updating)
+        pane = new.right
+        pane.change_favorite(str(self.target))
+        self.assertEqual(self.session.app.favorites.list(""), [str(self.target)])
+        pane.perform("mkdir", [str(self.target)], "work")
+        self.wait_for(lambda: pane.view.topLevelItemCount() == 1)
+        self.assertEqual(pane.view.topLevelItem(0).text(0), "work")
+        pane.perform("rename", [str(self.target / "work")], "ready")
+        self.wait_for(lambda: pane.view.topLevelItemCount() == 1 and pane.view.topLevelItem(0).text(0) == "ready")
+
+    def test_queue_row_keeps_progress_and_can_be_removed(self):
+        self.tab.right.receive(self.session.mime("", [str(self.first)]))
+        self.expect_file(self.target / self.first.name, self.first)
+        self.wait_for(lambda: self.window.jobs.topLevelItemCount() == 1
+                      and self.window.jobs.topLevelItem(0).text(6) == "已完成")
+        row = self.window.jobs.topLevelItem(0)
+        self.assertEqual(row.data(3, Qt.ItemDataRole.UserRole), 100)
+        self.assertTrue(row.text(4).endswith("/s"))
+        self.window.remove_jobs([row.data(0, Qt.ItemDataRole.UserRole)])
+        self.assertEqual(self.window.jobs.topLevelItemCount(), 0)
 
 
 if __name__ == "__main__":

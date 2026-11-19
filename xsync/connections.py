@@ -1,4 +1,5 @@
 import base64
+import errno
 import hashlib
 import ipaddress
 import os
@@ -6,10 +7,14 @@ import posixpath
 import re
 import socket
 import stat
+import threading
+import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 
 import paramiko
+from paramiko.sftp import CMD_CLOSE, CMD_HANDLE, CMD_NAME, CMD_OPENDIR, CMD_READDIR
 
 
 TIMEOUT = 12
@@ -87,9 +92,11 @@ def ssh_client(host):
 
 
 @contextmanager
-def sftp_client(host):
+def sftp_client(host, *, bulk=False):
     with ssh_client(host) as client:
-        with client.open_sftp() as sftp:
+        transport = client.get_transport()
+        options = {"window_size": 8 * 1024 * 1024} if bulk else {}
+        with paramiko.SFTPClient.from_transport(transport, **options) as sftp:
             sftp.get_channel().settimeout(TIMEOUT)
             yield sftp
 
@@ -115,40 +122,157 @@ def entry_kind(mode):
     return "other"
 
 
-def list_files(host, value):
+def read_remote_directory(sftp, path, limit, check=None):
+    # Paramiko's listdir_iter can leave request records and open directory handles.
+    # Using its synchronous requests keeps both bounded when reusing a channel.
+    kind, message = sftp._request(CMD_OPENDIR, path)
+    if kind != CMD_HANDLE:
+        raise paramiko.SFTPError("Expected a directory handle.")
+    handle = message.get_binary()
     entries = []
-    if host:
-        with sftp_client(host) as sftp:
-            path = sftp.normalize(".") if not value else endpoint_path(value, True)
-            for i, item in enumerate(sftp.listdir_iter(path, read_aheads=4)):
-                if i == LIST_LIMIT:
-                    break
-                if item.filename in (".", ".."):
+    try:
+        while True:
+            if check:
+                check()
+            try:
+                kind, message = sftp._request(CMD_READDIR, handle)
+            except EOFError:
+                return entries, False
+            if kind != CMD_NAME:
+                raise paramiko.SFTPError("Expected directory entries.")
+            for _ in range(message.get_int()):
+                name = message.get_text()
+                longname = message.get_text()
+                info = paramiko.SFTPAttributes._from_msg(message, name, longname)
+                if name in ("", ".", "..") or "/" in name:
                     continue
-                entries.append({
-                    "name": item.filename, "path": posixpath.join(path, item.filename),
-                    "kind": entry_kind(item.st_mode or 0), "size": item.st_size or 0,
-                })
-            else:
-                i = -1
+                if len(entries) == limit:
+                    return entries, True
+                entries.append(info)
+    finally:
+        sftp._request(CMD_CLOSE, handle)
+
+
+def list_files(host, value, sftp=None):
+    if host and sftp is None:
+        with sftp_client(host) as connection:
+            return list_files(host, value, connection)
+    entries = []
+    truncated = False
+    if sftp is not None:
+        path = endpoint_path(value, True) if value else sftp.normalize(".")
+        items, truncated = read_remote_directory(sftp, path, LIST_LIMIT)
+        for item in items:
+            entries.append({"name": item.filename, "path": posixpath.join(path, item.filename),
+                            "kind": entry_kind(item.st_mode or 0), "size": item.st_size or 0})
         parent = posixpath.dirname(path.rstrip("/")) or "/"
-        truncated = i == LIST_LIMIT
     else:
         path = endpoint_path(value or str(Path.home()), False)
-        truncated = False
         with os.scandir(path) as listing:
-            for i, item in enumerate(listing):
-                if i == LIST_LIMIT:
+            for item in listing:
+                if len(entries) == LIST_LIMIT:
                     truncated = True
                     break
                 try:
                     info = item.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                entries.append({
-                    "name": item.name, "path": item.path,
-                    "kind": entry_kind(info.st_mode), "size": info.st_size,
-                })
+                entries.append({"name": item.name, "path": item.path,
+                                "kind": entry_kind(info.st_mode), "size": info.st_size})
         parent = str(Path(path).parent)
     entries.sort(key=lambda entry: (entry["kind"] != "directory", entry["name"].casefold()))
     return {"path": path, "parent": parent, "entries": entries, "truncated": truncated}
+
+
+class BrowseConnection:
+    def __init__(self, host):
+        self.host = host
+        self.lock = threading.Lock()
+        self.active = 0
+        self.touched = time.monotonic()
+        self.context = None
+        self.sftp = None
+        self.cache = OrderedDict()
+        self.home = ""
+
+    def close(self):
+        context, self.context = self.context, None
+        self.sftp = None
+        if context:
+            context.__exit__(None, None, None)
+
+    def list(self, value, force):
+        with self.lock:
+            if force:
+                self.cache.clear()
+            path = endpoint_path(value, True) if value else self.home
+            cached = self.cache.get(path)
+            if cached and time.monotonic() - cached[0] < 8:
+                self.cache.move_to_end(path)
+                return cached[1]
+            for attempt in range(2):
+                try:
+                    if self.sftp is None:
+                        context = sftp_client(self.host)
+                        self.sftp = context.__enter__()
+                        self.context = context
+                    result = list_files(self.host, path, self.sftp)
+                    break
+                except (EOFError, OSError, paramiko.SSHException) as exc:
+                    if isinstance(exc, OSError) and exc.errno in (errno.ENOENT, errno.EACCES, errno.ENOTDIR):
+                        raise
+                    self.close()
+                    if attempt or isinstance(exc, (paramiko.BadHostKeyException, paramiko.AuthenticationException)):
+                        raise
+            if not value:
+                self.home = result["path"]
+            self.cache[result["path"]] = (time.monotonic(), result)
+            self.cache.move_to_end(result["path"])
+            while len(self.cache) > 6:
+                self.cache.popitem(last=False)
+            return result
+
+
+class Browser:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entries = OrderedDict()
+
+    def list(self, host, value, force=False):
+        if not host:
+            return list_files(None, value)
+        key = (host["id"], host["host"], host["port"], host["user"], host["identity"], host["hostKey"]["key"])
+        with self.lock:
+            self.prune(time.monotonic())
+            connection = self.entries.get(key)
+            if connection is None and len(self.entries) >= 8:
+                oldest = next((item for item in self.entries if not self.entries[item].active), None)
+                if oldest is not None:
+                    self.entries.pop(oldest).close()
+            pooled = connection is not None or len(self.entries) < 8
+            if connection is None:
+                connection = BrowseConnection(host)
+            if pooled:
+                self.entries[key] = connection
+                self.entries.move_to_end(key)
+            connection.active += 1
+        try:
+            return connection.list(value, force)
+        finally:
+            with self.lock:
+                connection.active -= 1
+                connection.touched = time.monotonic()
+                if not pooled:
+                    connection.close()
+
+    def prune(self, now):
+        for key, item in list(self.entries.items()):
+            if not item.active and now - item.touched > 90:
+                item.close()
+                del self.entries[key]
+
+    def close(self):
+        with self.lock:
+            for entry in self.entries.values():
+                entry.close()
+            self.entries.clear()

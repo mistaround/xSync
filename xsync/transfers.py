@@ -17,10 +17,12 @@ from pathlib import Path, PureWindowsPath
 
 import paramiko
 
-from .connections import TIMEOUT, known_name, sftp_client
+from .connections import TIMEOUT, known_name, read_remote_directory, sftp_client
 
 
 CHUNK = 256 * 1024
+READ_REQUESTS = 128
+RSYNC_PROGRESS = re.compile(rb"^\s*([\d,]+)\s+(\d+)%\s+([\d.]+)([kMGT]?)B/s\s+(\d+):(\d{2}):(\d{2})")
 MAX_PENDING = 32
 MAX_HISTORY = 100
 MODES = {"auto", "rsync", "sftp", "scp"}
@@ -31,10 +33,10 @@ class Cancelled(Exception):
     pass
 
 
-def verify_name(name):
-    if not name or name in (".", "..") or "/" in name or "\\" in name:
+def verify_name(name, *, windows=os.name == "nt"):
+    if not name or name in (".", "..") or "/" in name or (windows and "\\" in name) or "\0" in name:
         raise ValueError("The transfer contains an unsupported file name.")
-    if os.name == "nt" and (
+    if windows and (
         any(c in name for c in '<>:"|?*') or name.endswith((" ", ".")) or PureWindowsPath(name).is_reserved()
     ):
         raise ValueError(f"Windows cannot store the file {name!r}.")
@@ -50,27 +52,29 @@ class Filesystem:
         return self.sftp.lstat(path) if self.sftp else os.lstat(path)
 
     def exists(self, path):
+        return self.info_or_none(path) is not None
+
+    def info_or_none(self, path):
         try:
-            self.info(path)
+            return self.info(path)
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                return False
+                return None
             raise
-        return True
 
     def names(self, path, check):
+        return (name for name, _ in self.entries(path, check))
+
+    def entries(self, path, check):
         if self.sftp:
-            # Finish reading directory replies before opening files on this channel.
-            names = []
-            for item in self.sftp.listdir_iter(path, read_aheads=1):
-                check()
-                if len(names) >= 20_000:
-                    raise ValueError("SFTP directory exceeds 20,000 entries. Split the transfer or use rsync.")
-                names.append(item.filename)
-            yield from names
+            entries, truncated = read_remote_directory(self.sftp, path, 20_000, check)
+            if truncated:
+                raise ValueError("SFTP directory exceeds 20,000 entries. Split the transfer or use rsync.")
+            yield from ((item.filename, item if item.st_mode is not None else None) for item in entries)
         else:
             with os.scandir(path) as listing:
-                yield from (item.name for item in listing)
+                for item in listing:
+                    yield item.name, item.stat(follow_symlinks=False)
 
     def open(self, path, mode):
         if self.sftp:
@@ -98,34 +102,56 @@ class Filesystem:
             os.unlink(temp)
 
 
-def copy_tree(job, source, source_path, dest, dest_path, overwrite):
+def stream_read(reader, remote, size, check):
+    if not remote or size is None:
+        while True:
+            check()
+            block = reader.read(CHUNK)
+            if not block:
+                return
+            yield block
+    else:
+        packet_size = min(reader.MAX_REQUEST_SIZE, 32 * 1024)
+        window = packet_size * READ_REQUESTS
+        for start in range(0, size, window):
+            check()
+            end = min(size, start + window)
+            requests = [(offset, min(packet_size, end - offset)) for offset in range(start, end, packet_size)]
+            for (_, expected), block in zip(requests, reader.readv(requests, READ_REQUESTS), strict=True):
+                check()
+                if len(block) != expected:
+                    raise OSError("The source file changed during transfer.")
+                yield block
+
+
+def copy_tree(job, source, source_path, dest, dest_path, overwrite, info=None, root=True):
     job.check()
-    mode = source.info(source_path).st_mode
+    info = info or source.info(source_path)
+    mode = info.st_mode
+    existing = dest.info_or_none(dest_path)
     if stat.S_ISDIR(mode):
-        if dest.exists(dest_path):
-            if not overwrite or not stat.S_ISDIR(dest.info(dest_path).st_mode):
+        if existing is not None:
+            if not overwrite or not stat.S_ISDIR(existing.st_mode):
                 raise FileExistsError(f"Destination already exists: {dest_path}")
         else:
             dest.mkdir(dest_path)
-        for name in source.names(source_path, job.check):
-            verify_name(name)
+        for name, entry in source.entries(source_path, job.check):
+            verify_name(name, windows=not dest.sftp and os.name == "nt")
             copy_tree(job, source, source.paths.join(source_path, name),
-                      dest, dest.paths.join(dest_path, name), overwrite)
+                      dest, dest.paths.join(dest_path, name), overwrite, entry, root=False)
         return
     if not stat.S_ISREG(mode):
         raise ValueError(f"Only regular files and folders can be transferred: {source_path}")
-    if dest.exists(dest_path) and (not overwrite or not stat.S_ISREG(dest.info(dest_path).st_mode)):
+    if existing is not None and (not overwrite or not stat.S_ISREG(existing.st_mode)):
         raise FileExistsError(f"Destination already exists: {dest_path}")
+    if root:
+        job.update(total=info.st_size)
     temp = dest.paths.join(dest.paths.dirname(dest_path), f".xsync-{uuid.uuid4().hex}.part")
     created = False
     try:
         with source.open(source_path, "rb") as reader, dest.open(temp, "xb") as writer:
             created = True
-            while True:
-                job.check()
-                chunk = reader.read(CHUNK)
-                if not chunk:
-                    break
+            for chunk in stream_read(reader, source.sftp is not None, info.st_size, job.check):
                 writer.write(chunk)
                 job.progress(len(chunk))
         job.check()
@@ -161,7 +187,7 @@ def ssh_flags(host, pins=None):
     return flags
 
 
-def run_process(job, args, timeout=None):
+def run_process(job, args, timeout=None, report_progress=False, observe=None):
     job.check()
     tail = bytearray()
     no_window = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -169,9 +195,19 @@ def run_process(job, args, timeout=None):
                           stderr=subprocess.STDOUT, start_new_session=os.name != "nt",
                           creationflags=no_window) as process:
         def read_output():
-            while block := process.stdout.read(4096):
+            pending = b""
+            while block := process.stdout.read1(4096):
                 tail.extend(block)
                 del tail[:-8192]
+                if report_progress:
+                    *lines, pending = re.split(rb"[\r\n]", pending + block)
+                    pending = pending[-1024:]
+                    for line in lines:
+                        if match := RSYNC_PROGRESS.match(line):
+                            count, percent, rate, unit, hour, minute, second = match.groups()
+                            speed = float(rate) * 1024 ** [b"", b"k", b"M", b"G", b"T"].index(unit)
+                            job.update(bytes=int(count.replace(b",", b"")), percent=int(percent),
+                                       rate=speed, eta=int(hour) * 3600 + int(minute) * 60 + int(second))
 
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
@@ -181,6 +217,8 @@ def run_process(job, args, timeout=None):
                 job.check()
                 if timeout is not None and time.monotonic() - started > timeout:
                     raise TimeoutError("SSH capability check timed out.")
+                if observe:
+                    observe()
                 job.cancelled.wait(0.15)
         finally:
             if process.poll() is None:
@@ -240,8 +278,9 @@ def rsync_leg(job, tools, host, pins, local, remote, upload):
         reject_existing(local, job.overwrite)
         pair = [remote_spec(host, remote), local_rsync_path(os.path.dirname(local)).rstrip("/") + "/"]
     status, message = run_process(
-        job, [tools["rsync"], "-rts", "--timeout=60",
+        job, [tools["rsync"], "-rts", "--timeout=60", "--info=progress2", "--outbuf=L",
               *(["--ignore-existing"] if not job.overwrite else []), "-e", shell, "--", *pair],
+        report_progress=True,
     )
     if status:
         raise RuntimeError(message or f"rsync exited with code {status}.")
@@ -272,12 +311,12 @@ def direct_rsync(job, tools, pins):
     target = remote_spec(dest, posixpath.dirname(job.dest_path).rstrip("/") + "/")
     pairs = shlex.join(["--", job.source_path, target])
     transport = shlex.quote(rsync_transport(["ssh", *flags]))
-    copy_flags = "-rts --timeout=60" + ("" if job.overwrite else " --ignore-existing")
+    copy_flags = "-rts --timeout=60 --info=progress2 --outbuf=L" + ("" if job.overwrite else " --ignore-existing")
     command = preamble + f'rsync {copy_flags} -e {transport}" -o UserKnownHostsFile=$pins/known_hosts" {pairs}'
     job.phase("rsync", "Transferring directly between servers")
     status, message = run_process(
         job, [tools["ssh"], *ssh_flags(source, pins[source["id"]]), "-l", source["user"],
-              "--", source["host"], command],
+              "--", source["host"], command], report_progress=True,
     )
     if status:
         raise RuntimeError(message or f"Direct rsync exited with code {status}.")
@@ -303,15 +342,19 @@ def source_kind(mode, path, directory_allowed=True):
         raise ValueError(f"Unsupported source type: {path}")
 
 
-def verify_remote_source(job, tools, host, pins, path, directory_allowed=True):
+def verify_remote_source(job, tools, host, pins, path, directory_allowed=True, file_size=False):
     quoted = shlex.quote(path)
     types = f"test -f {quoted}"
     if directory_allowed:
         types += f" || test -d {quoted}"
     command = f"test ! -L {quoted} && ({types})"
+    if file_size:
+        command += f" && (stat -c %s {quoted} 2>/dev/null || stat -f %z {quoted} 2>/dev/null || true)"
     status, message = remote_command(job, tools, host, pins, command)
     if status:
         raise ValueError(message or f"Source is missing or has an unsupported type: {path}")
+    if file_size and message.isdecimal():
+        return int(message)
 
 
 def reject_existing(path, overwrite):
@@ -321,10 +364,12 @@ def reject_existing(path, overwrite):
 
 def scp_leg(job, tools, host, pins, local, remote, upload, legacy):
     if upload:
-        source_kind(os.lstat(local).st_mode, local, directory_allowed=False)
+        info = os.lstat(local)
+        source_kind(info.st_mode, local, directory_allowed=False)
         reject_remote_target(job, tools, host, pins, remote, file_only=True)
+        size = info.st_size
     else:
-        verify_remote_source(job, tools, host, pins, remote, directory_allowed=False)
+        size = verify_remote_source(job, tools, host, pins, remote, directory_allowed=False, file_size=True)
         reject_existing(local, job.overwrite)
         if os.path.lexists(local):
             source_kind(os.lstat(local).st_mode, local, directory_allowed=False)
@@ -334,15 +379,37 @@ def scp_leg(job, tools, host, pins, local, remote, upload, legacy):
         # Legacy SCP uses a remote shell and matches the requested basename with fnmatch.
         # Backslash escaping keeps the name literal for both parsers.
         remote = re.sub(r"[^\w/.,+\-]", lambda char: "\\" + char[0], remote)
-    pair = [local, remote_spec(host, remote)]
+    remote = remote_spec(host, remote)
     flags = ssh_flags(host, pins)
     flags[2] = "-P"
-    status, message = run_process(
-        job, [tools["scp"], "-B", *(["-O"] if legacy else []), *flags,
-              "--", *(pair if upload else pair[::-1])],
-    )
-    if status:
-        raise RuntimeError(message or f"SCP exited with code {status}.")
+    args = [tools["scp"], "-B", *(["-O"] if legacy else []), *flags, "--"]
+    job.update(total=size)
+    if upload:
+        status, message = run_process(job, [*args, local, remote])
+        if status:
+            raise RuntimeError(message or f"SCP exited with code {status}.")
+        job.progress(size)
+        return
+    # Publish the file only after SCP succeeds, so retrying a failed download is safe.
+    with tempfile.TemporaryDirectory(prefix=".xsync-", dir=os.path.dirname(local)) as stage:
+        staged_file = os.path.join(stage, os.path.basename(local))
+        observed = 0
+
+        def observe():
+            nonlocal observed
+            try:
+                size = os.path.getsize(staged_file)
+            except FileNotFoundError:
+                return
+            job.progress(max(0, size - observed))
+            observed = size
+
+        status, message = run_process(job, [*args, remote, staged_file], observe=observe)
+        if status:
+            raise RuntimeError(message or f"SCP exited with code {status}.")
+        job.check()
+        observe()
+        Filesystem().publish(staged_file, local, job.overwrite)
 
 
 def transfer(job):
@@ -371,7 +438,9 @@ def transfer(job):
         if job.direct and tools["ssh"] and direct_rsync(job, tools, pin_files):
             return
         rsync = False
-        if mode in {"auto", "rsync"} and tools["ssh"] and tools["rsync"]:
+        local_paths = [path for host, path in ((source, job.source_path), (dest, job.dest_path)) if not host]
+        rsync_paths = os.name != "nt" or all(os.path.splitdrive(path)[0].endswith(":") for path in local_paths)
+        if mode in {"auto", "rsync"} and tools["ssh"] and tools["rsync"] and rsync_paths:
             local_status, _ = run_process(job, [tools["rsync"], "--version"], timeout=10)
             if local_status == 0:
                 rsync = True
@@ -390,7 +459,7 @@ def transfer(job):
                 for side, host in (("source", source), ("dest", dest)):
                     job.check()
                     try:
-                        endpoints[side] = Filesystem(stack.enter_context(sftp_client(host)) if host else None)
+                        endpoints[side] = Filesystem(stack.enter_context(sftp_client(host, bulk=True)) if host else None)
                     except (OSError, EOFError, paramiko.SSHException) as exc:
                         if mode == "sftp" or isinstance(exc, paramiko.BadHostKeyException):
                             raise
@@ -455,12 +524,16 @@ class Job:
         self.direct_key = direct_key
         self.cancelled = threading.Event()
         self.lock = threading.Lock()
+        self.sample_time = time.monotonic()
+        self.phase_start = self.sample_time
+        self.sample_bytes = 0
         self.data = {
             "id": uuid.uuid4().hex, "workspace": workspace, "state": "queued",
             "file": (posixpath if source else os.path).basename(source_path),
             "source": source["name"] if source else "This computer",
             "destination": dest["name"] if dest else "This computer",
             "protocol": "", "phase": "Waiting", "bytes": 0, "error": "",
+            "total": None, "percent": None, "rate": 0, "eta": None,
         }
 
     def snapshot(self):
@@ -472,11 +545,31 @@ class Job:
             self.data.update(data)
 
     def phase(self, protocol, phase):
-        self.update(protocol=protocol, phase=phase)
+        with self.lock:
+            self.sample_time, self.sample_bytes = time.monotonic(), 0
+            self.phase_start = self.sample_time
+            self.data.update(protocol=protocol, phase=phase, bytes=0, total=None, percent=None, rate=0, eta=None)
 
     def progress(self, count):
         with self.lock:
             self.data["bytes"] += count
+            now = time.monotonic()
+            duration = now - self.sample_time
+            if duration >= 0.35:
+                self.data["rate"] = (self.data["bytes"] - self.sample_bytes) / duration
+                self.sample_time, self.sample_bytes = now, self.data["bytes"]
+
+    def complete(self):
+        with self.lock:
+            if not self.data["rate"] and self.data["bytes"]:
+                self.data["rate"] = self.data["bytes"] / max(0.001, time.monotonic() - self.phase_start)
+            self.data.update(state="done", phase="Completed", percent=100, eta=0)
+
+    def clone(self):
+        job = Job(self.source, self.source_path, self.dest, self.dest_path, self.protocol, self.overwrite,
+                  self.data["workspace"], self.direct, self.direct_key)
+        job.update(source=self.data["source"], destination=self.data["destination"])
+        return job
 
     def check(self):
         if self.cancelled.is_set():
@@ -525,6 +618,19 @@ class TransferQueue:
             if job.snapshot()["state"] == "queued":
                 job.update(state="cancelled", phase="Cancelled")
 
+    def remove_completed(self, identifiers=None):
+        with self.condition:
+            for key in list(self.jobs) if identifiers is None else identifiers:
+                item = self.jobs.get(key)
+                if item and item.snapshot()["state"] not in ACTIVE:
+                    del self.jobs[key]
+
+    def retry(self, identifiers):
+        with self.condition:
+            candidates = [self.jobs[key].clone() for key in identifiers
+                          if key in self.jobs and self.jobs[key].snapshot()["state"] in {"failed", "cancelled"}]
+        return self.add_batch(candidates)
+
     def available(self):
         for job in self.jobs.values():
             if job.snapshot()["state"] == "queued":
@@ -545,7 +651,7 @@ class TransferQueue:
                 job.update(state="running", phase="Starting")
             try:
                 transfer(job)
-                job.update(state="done", phase="Completed")
+                job.complete()
             except Cancelled:
                 job.update(state="cancelled", phase="Cancelled")
             except Exception as exc:

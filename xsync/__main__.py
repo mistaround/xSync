@@ -15,7 +15,8 @@ from pathlib import Path
 
 import paramiko
 
-from .connections import endpoint_path, list_files, profile, scan_key, server_address
+from .connections import Browser, endpoint_path, profile, scan_key, server_address
+from .filesystem import WSL_PREFIX, is_wsl, operate, remote_endpoint, wsl_path
 from .transfers import Job, MODES, TransferQueue, tools_for_job, verify_name
 
 
@@ -25,6 +26,48 @@ ASSETS = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
 MAX_PROFILES = 100
+
+
+def write_json(path, values):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, encoding="utf-8", delete=False) as file:
+        temp = Path(file.name)
+        try:
+            json.dump(values, file, ensure_ascii=False, indent=2)
+            file.close()
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+class Favorites:
+    def __init__(self, directory):
+        self.file = directory / "favorites.json"
+        self.values = json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists() else {}
+        self.lock = threading.Lock()
+
+    def list(self, endpoint):
+        with self.lock:
+            return list(self.values.get(endpoint, []))
+
+    def change(self, endpoint, path, remove=False):
+        with self.lock:
+            paths = self.values.get(endpoint, [])
+            if remove:
+                paths = [item for item in paths if item != path]
+            elif path not in paths:
+                if len(paths) >= 64:
+                    raise ValueError("每个连接最多保存 64 个收藏。")
+                paths = [*paths, path]
+            values = {**self.values, endpoint: paths}
+            write_json(self.file, values)
+            self.values = values
+
+    def forget(self, endpoint):
+        with self.lock:
+            if endpoint in self.values:
+                values = {key: paths for key, paths in self.values.items() if key != endpoint}
+                write_json(self.file, values)
+                self.values = values
 
 
 class Profiles:
@@ -60,20 +103,15 @@ class Profiles:
             self.write(updated)
 
     def write(self, updated):
-        with tempfile.NamedTemporaryFile(mode="w", dir=self.file.parent, encoding="utf-8", delete=False) as file:
-            temp = Path(file.name)
-            try:
-                json.dump(updated, file, ensure_ascii=False, indent=2)
-                file.close()
-                temp.replace(self.file)
-            finally:
-                temp.unlink(missing_ok=True)
+        write_json(self.file, updated)
         self.hosts = updated
 
 
 class Application:
     def __init__(self, directory):
         self.profiles = Profiles(directory)
+        self.favorites = Favorites(directory)
+        self.browser = Browser()
         self.jobs = TransferQueue()
         self.network_slots = threading.BoundedSemaphore(8)
 
@@ -85,11 +123,11 @@ class Application:
             with self.network_slots:
                 if path == "/api/scan":
                     return scan_key(*server_address(data["host"], data.get("port", 22)))
-                return list_files(self.profiles.get(data.get("host")), data.get("path"))
+                return self.browse(data.get("host"), data.get("path"), data.get("force", True))
         if path == "/api/hosts/save":
             return self.profiles.save(data)
         if path == "/api/hosts/remove":
-            self.profiles.remove(data["id"])
+            self.remove_host(data["id"])
             return {}
         if path == "/api/jobs":
             return self.jobs.list()
@@ -103,17 +141,44 @@ class Application:
     def start_job(self, data):
         return self.jobs.add(self.create_job(data))
 
+    def browse(self, endpoint, path, force=False):
+        if is_wsl(endpoint):
+            resolved = wsl_path(endpoint, path or "")
+            try:
+                result = self.browser.list(None, resolved)
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (53, 67) or not resolved.lower().startswith("\\\\wsl.localhost\\"):
+                    raise
+                result = self.browser.list(None, "\\\\wsl$\\" + resolved[len("\\\\wsl.localhost\\"):])
+            result["parent"] = wsl_path(endpoint, result["parent"])
+            return result
+        return self.browser.list(self.profiles.get(endpoint), path, force)
+
+    def file_operation(self, endpoint, operation, paths, name=""):
+        if is_wsl(endpoint):
+            paths = [wsl_path(endpoint, path) for path in paths]
+        operate(self.profiles.get(remote_endpoint(endpoint)), operation, paths, name)
+
+    def remove_host(self, endpoint):
+        self.profiles.remove(endpoint)
+        self.favorites.forget(endpoint)
+
+    def close(self):
+        self.jobs.close()
+        self.browser.close()
+
     def create_job(self, data):
         protocol = data.get("protocol", "auto")
         if protocol not in MODES:
             raise ValueError("Invalid transfer protocol.")
-        source = self.profiles.get(data.get("source"))
-        dest = self.profiles.get(data.get("destination"))
-        src_path = endpoint_path(data["path"], bool(source))
-        dest_dir = endpoint_path(data["directory"], bool(dest))
+        source_id, dest_id = data.get("source"), data.get("destination")
+        source = self.profiles.get(remote_endpoint(source_id))
+        dest = self.profiles.get(remote_endpoint(dest_id))
+        src_path = wsl_path(source_id, data["path"]) if is_wsl(source_id) else endpoint_path(data["path"], bool(source))
+        dest_dir = wsl_path(dest_id, data["directory"]) if is_wsl(dest_id) else endpoint_path(data["directory"], bool(dest))
         source_paths = posixpath if source else os.path
         dest_paths = posixpath if dest else os.path
-        name = verify_name(source_paths.basename(src_path))
+        name = verify_name(source_paths.basename(src_path), windows=not dest and os.name == "nt")
         target = dest_paths.join(dest_dir, name)
         if not source and not dest:
             src = Path(src_path).resolve()
@@ -128,8 +193,13 @@ class Application:
             raise ValueError("Invalid workspace.")
         direct = data.get("direct") is True and source and dest and protocol in {"auto", "rsync"}
         direct_key = endpoint_path(data["direct_key"], True) if direct and data.get("direct_key") else ""
-        return Job(source, src_path, dest, target, protocol, data.get("overwrite") is True,
-                   workspace, direct, direct_key)
+        job = Job(source, src_path, dest, target, protocol, data.get("overwrite") is True,
+                  workspace, direct, direct_key)
+        if is_wsl(source_id):
+            job.update(source="WSL · " + source_id.removeprefix(WSL_PREFIX))
+        if is_wsl(dest_id):
+            job.update(destination="WSL · " + dest_id.removeprefix(WSL_PREFIX))
+        return job
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -241,7 +311,7 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
-            server.app.jobs.close()
+            server.app.close()
 
 
 if __name__ == "__main__":
