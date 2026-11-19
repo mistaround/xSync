@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xSync · File Transfer</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">⇄</div>
+      <div><strong>xSync</strong><span>File Transfer</span></div>
+    </div>
+    <div class="connection-heading">CONNECTIONS <button id="add-host" class="icon" title="Add connection" aria-label="Add connection">+</button></div>
+    <div id="hosts"></div>
+    <div class="sidebar-footer"><span class="status-dot"></span> Local session</div>
+  </aside>
+  <main>
+    <header class="topbar">
+      <h1>File workspace</h1>
+      <button id="new-window" class="button">New window</button>
+    </header>
+    <nav class="tabbar" aria-label="Workspaces">
+      <div id="tabs" role="tablist" aria-label="Open workspaces"></div>
+      <button class="icon" id="add-tab" title="New workspace tab" aria-label="New workspace tab">+</button>
+    </nav>
+    <div class="work-area">
+      <div class="panes">
+        <section id="left" class="pane" aria-label="Left file browser"></section>
+        <div class="transfer-buttons">
+          <button id="send-right" class="button send" title="Transfer left to right" aria-label="Transfer left to right">→</button>
+          <button id="send-left" class="button" title="Transfer right to left" aria-label="Transfer right to left">←</button>
+        </div>
+        <section id="right" class="pane" aria-label="Right file browser"></section>
+      </div>
+      <section class="queue" aria-labelledby="queue-title">
+        <header class="queue-header">
+          <div class="queue-title"><h2 id="queue-title">Transfers</h2><span id="queue-count"></span></div>
+          <label class="filter"><input type="checkbox" id="workspace-only"> This workspace</label>
+        </header>
+        <div id="jobs" aria-live="off"></div>
+      </section>
+    </div>
+  </main>
+  <template id="pane-template">
+    <header class="pane-heading">
+      <div class="device-icon" aria-hidden="true"><i></i></div>
+      <div class="pane-identity"><strong></strong><small></small></div>
+      <select class="endpoint" aria-label="Choose endpoint"></select>
+    </header>
+    <form class="navigation">
+      <button type="button" class="icon up" title="Parent folder" aria-label="Parent folder">↑</button>
+      <input class="path" aria-label="Folder path" spellcheck="false" placeholder="Enter an absolute path">
+      <button type="button" class="icon refresh" title="Refresh folder" aria-label="Refresh folder">↻</button>
+    </form>
+    <div class="file-head"><span>Name</span><span>Size</span></div>
+    <div class="file-list"></div>
+    <footer class="pane-footer"></footer>
+  </template>
+  <dialog id="host-dialog">
+    <form id="host-form">
+      <div class="dialog-header"><h2 id="host-title">Add connection</h2><button type="button" class="icon close" aria-label="Close">×</button></div>
+      <label>Name<input name="name" required maxlength="80" placeholder="Production server"></label>
+      <div class="fields"><label>Hostname or IP<input name="host" required placeholder="server.example.com"></label><label>Port<input name="port" type="number" min="1" max="65535" value="22" required></label></div>
+      <label>SSH username<input name="user" required placeholder="deploy"></label>
+      <label>Private key path <small>Optional if your SSH agent or default key is available</small><input name="identity" placeholder="C:\Users\you\.ssh\id_ed25519"></label>
+      <div class="trust">
+        <button type="button" class="button" id="scan-key">Check host key</button>
+        <div id="key-result" hidden><code id="fingerprint"></code><label class="check"><input type="checkbox" name="trusted"> I verified this fingerprint with the server administrator</label></div>
+      </div>
+      <p class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button type="button" class="button danger" id="remove-host" hidden>Remove</button><button class="button primary" type="submit">Save connection</button></div>
+    </form>
+  </dialog>
+  <dialog id="transfer-dialog">
+    <form id="transfer-form">
+      <div class="dialog-header"><h2>Start transfer</h2><button type="button" class="icon close" aria-label="Close">×</button></div>
+      <label><span id="source-label"></span><input name="path" required spellcheck="false" placeholder="/absolute/path/to/file"></label>
+      <label><span id="destination-label"></span><input name="directory" required spellcheck="false" placeholder="/absolute/destination/folder"></label>
+      <label>Protocol<select name="protocol"><option value="auto">Auto · rsync → SFTP → SCP</option><option value="rsync">rsync</option><option value="sftp">SFTP</option><option value="scp">SCP</option></select></label>
+      <label class="check" id="direct-option" hidden><input type="checkbox" name="direct"> Try direct rsync using SSH credentials on the source host</label>
+      <label id="direct-key" hidden>Private key path on the source <small>Optional if the source has a default SSH key</small><input name="direct_key" placeholder="/home/deploy/.ssh/id_ed25519" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="overwrite"> Replace existing files and merge folders</label>
+      <p class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button class="button primary" type="submit">Add to queue</button></div>
+    </form>
+  </dialog>
+  <div id="notice" role="status" hidden></div>
+</body>
+</html>
